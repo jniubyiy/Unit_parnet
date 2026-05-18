@@ -1,48 +1,41 @@
 # config_training_tag_unit.py
 """
-Конфигурация для обучения моделей tag, unit1, unit2.
-Все архитектурные параметры вынесены сюда.
+Конфигурация для обучения моделей tag и UnifiedUnitParnet (единая модель).
 """
 
 # ======================== ParNetTag =============================
 TAG_MODEL_HIDDEN_DIM = 256
-TAG_MODEL_NUM_LAYERS = 4
-TAG_MODEL_DROPOUT = 0.1          # dropout между слоями MLP (0 = без dropout)
+TAG_MODEL_NUM_LAYERS = 3
+TAG_MODEL_DROPOUT = 0.1          # dropout между слоями MLP
 
-# ======================== UnitParnet1 ===========================
-UNIT1_IN_CHANNELS = 4
-UNIT1_OUT_CHANNELS = 4
+# ======================== UnifiedUnitParnet ======================
+# Входо‑выходные каналы сжатого парнета
+UNIT_IN_CHANNELS = 4
+UNIT_OUT_CHANNELS = 4
 
-# Основной извлекатель признаков (img_conv)
-UNIT1_IMG_CONV_HIDDEN = 128        # размерность скрытого слоя
-UNIT1_IMG_CONV_LAYERS = 4         # количество свёрток в блоке (каждая с GELU)
-UNIT1_IMG_CONV_DROPOUT = 0.0
+# Текстовая ветвь (поиск «что сохранить»)
+UNIT_TXT_FEAT_HIDDEN = 64
+UNIT_TXT_FEAT_LAYERS = 2
+UNIT_TXT_FEAT_DROPOUT = 0.0
 
-# Кодировщик текста (text_encoder)
-UNIT1_TEXT_HIDDEN = 128            # скрытая размерность в свёртке 1x1
-UNIT1_TEXT_DROPOUT = 0.0
+UNIT_TXT_ENCODER_HIDDEN = 64
+UNIT_TXT_ENCODER_DROPOUT = 0.0
 
-# Пространственное внимание
-UNIT1_ATTENTION_DROPOUT = 0.0
+UNIT_ATTN_DROPOUT = 0.0
 
-# Выходной блок (out_conv)
-UNIT1_OUT_CONV_HIDDEN = 128        # скрытая размерность
-UNIT1_OUT_CONV_LAYERS = 4         # число свёрток перед финальным слоем
-UNIT1_OUT_CONV_DROPOUT = 0.0
+# Шумовая ветвь (поиск «что удалить»)
+UNIT_NOISE_ENC_HIDDEN = 32
+UNIT_NOISE_ENC_LAYERS = 2
+UNIT_NOISE_ENC_DROPOUT = 0.0
 
-# ======================== UnitParnet2 ===========================
-UNIT2_IN_CHANNELS = 4
-UNIT2_OUT_CHANNELS = 4
+# Объединение и выход
+UNIT_FUSION_HIDDEN = 32
+UNIT_FUSION_LAYERS = 2
+UNIT_FUSION_DROPOUT = 0.0
 
-# Кодировщик шума (encoder)
-UNIT2_ENCODER_HIDDEN = 64
-UNIT2_ENCODER_LAYERS = 4          # число свёрток
-UNIT2_ENCODER_DROPOUT = 0.0
-
-# Блок предсказания остаточного шума (residual)
-UNIT2_RESIDUAL_HIDDEN = 64
-UNIT2_RESIDUAL_LAYERS = 4         # число свёрток перед финальным предсказанием
-UNIT2_RESIDUAL_DROPOUT = 0.0
+UNIT_RESIDUAL_HIDDEN = 32
+UNIT_RESIDUAL_LAYERS = 2
+UNIT_RESIDUAL_DROPOUT = 0.0
 
 # ─── Данные ───────────────────────────────────────────────────────
 DATASET_DIR_TAG = "./prepared_dataset_tag_image"  # папка с .pt и .txt
