@@ -10,11 +10,11 @@ TARGET_RESOLUTION = 512  # 256, 512, 1024, 2048 и т.д.
 
 # Директории
 DATASET_DIR = "./dataset_tag_image"                     # исходные изображения
-OUTPUT_DIR = "./prepared_dataset_tag_image" \
+OUTPUT_DIR = "./prepared_dataset_tag_image"
 ""      # куда сохранять парнеты (.pt)
 
 # Путь к предобученной инференс-модели энкодера (TorchScript)
 ENCODER_MODEL_PATH = "./models/encoder_inference.pt"
 
 # Количество параллельных процессов (по умолчанию – число ядер CPU)
-NUM_WORKERS = 20
+NUM_WORKERS = 1
