@@ -44,7 +44,11 @@ class ParnetTagDataset(Dataset):
         with open(self.txt_files[key], 'r', encoding='utf-8') as f:
             raw_line = f.read().strip()
             tags = [tag.strip() for tag in raw_line.split(',') if tag.strip()] if raw_line else []
-        return {'parnet_compressed': parnet_compressed, 'tags': tags, 'example_id': key}
+        return {
+            'parnet_compressed': parnet_compressed,
+            'tags': tags,
+            'example_id': key
+        }
 
 # ---------------------- Кодирование тегов ----------------------
 def encode_tags(tags_list, max_len=32, byte_len=128, pad_byte=0):
@@ -65,7 +69,11 @@ def encode_tags(tags_list, max_len=32, byte_len=128, pad_byte=0):
 
 # ---------------------- Коллат-функция ----------------------
 def collate_tag_fn(batch):
-    parnets, tags_batch, noises, example_ids, num_tags_list = [], [], [], [], []
+    parnets = []
+    tags_batch = []
+    noises = []
+    example_ids = []
+    num_tags_list = []
     for item in batch:
         parnet = item['parnet_compressed']
         tags = item['tags']
@@ -86,8 +94,14 @@ def collate_tag_fn(batch):
     noise_batch = torch.stack(noises, dim=0)
     tags_batch = torch.stack(tags_batch, dim=0)
     num_tags_tensor = torch.tensor(num_tags_list, dtype=torch.long)
-    return {'parnet_clean': parnet_clean, 'parnet_noisy': parnet_noisy, 'noise': noise_batch,
-            'tags_raw': tags_batch, 'num_tags': num_tags_tensor, 'example_ids': example_ids}
+    return {
+        'parnet_clean': parnet_clean,
+        'parnet_noisy': parnet_noisy,
+        'noise': noise_batch,
+        'tags_raw': tags_batch,
+        'num_tags': num_tags_tensor,
+        'example_ids': example_ids
+    }
 
 # ---------------------- Потери ----------------------
 def difference_loss(pred, target):
@@ -102,7 +116,10 @@ def compute_psnr(pred, target):
 # ---------------------- Подготовка tag_parnets ----------------------
 def compute_tag_parnets(tags_raw, num_tags, tag_model, device):
     B, max_len, byte_len = tags_raw.shape
-    real_tags_list = [tags_raw[i, :num_tags[i].item()] for i in range(B)]
+    real_tags_list = []
+    for i in range(B):
+        n = num_tags[i].item()
+        real_tags_list.append(tags_raw[i, :n])
     if real_tags_list:
         real_tags_batch = torch.cat(real_tags_list, dim=0).to(device)
     else:
@@ -148,12 +165,12 @@ def cleanup_old_checkpoints(models_dir, keep=cfg.MAX_CHECKPOINTS):
 
 def save_checkpoints(epoch, tag_model, opt_tag, unified_model, opt_unified, models_dir):
     os.makedirs(models_dir, exist_ok=True)
-    torch.save({'epoch': epoch, 'model_state_dict': tag_model.state_dict(),
-                'optimizer_state_dict': opt_tag.state_dict()},
-               get_model_path("tag", epoch, models_dir))
-    torch.save({'epoch': epoch, 'model_state_dict': unified_model.state_dict(),
-                'optimizer_state_dict': opt_unified.state_dict()},
-               get_model_path("unified", epoch, models_dir))
+    for name, model, opt in [("tag", tag_model, opt_tag), ("unified", unified_model, opt_unified)]:
+        torch.save({
+            'epoch': epoch,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': opt.state_dict(),
+        }, get_model_path(name, epoch, models_dir))
     cleanup_old_checkpoints(models_dir)
 
 def load_checkpoints_if_exist(tag_model, opt_tag, unified_model, opt_unified, models_dir):
@@ -186,7 +203,7 @@ def load_inference_decompressor(decompressor_path):
     model.eval()
     return model
 
-# ---------------------- Утилита конвертации одного сжатого парнета в PIL ----------------------
+# ---------------------- Конвертация сжатого парнета в PIL ----------------------
 def compressed_parnet_to_pil(compressed_parnet, decompressor, decoder):
     with torch.no_grad():
         x = compressed_parnet.unsqueeze(0).to(DEVICE_DECODER)
@@ -197,7 +214,7 @@ def compressed_parnet_to_pil(compressed_parnet, decompressor, decoder):
         arr = arr.permute(1, 2, 0).to(torch.uint8).numpy()
         return Image.fromarray(arr)
 
-# ---------------------- Тренировочная эпоха ----------------------
+# ---------------------- Тренировочная эпоха (две фазы) ----------------------
 def train_epoch_tag_unit(tag_model, unified_model, train_loader, opt_tag, opt_unified):
     tag_model.train()
     unified_model.train()
@@ -211,25 +228,52 @@ def train_epoch_tag_unit(tag_model, unified_model, train_loader, opt_tag, opt_un
         tags_raw = batch['tags_raw'].to(DEVICE_TAG)
         num_tags = batch['num_tags'].to(DEVICE_TAG)
 
-        opt_tag.zero_grad()
-        opt_unified.zero_grad()
+        # --- Фаза 1: UnifiedUnitParnet ---
+        for p in tag_model.parameters():
+            p.requires_grad = False
+        for p in unified_model.parameters():
+            p.requires_grad = True
+
+        with torch.no_grad():
+            tag_parnets = compute_tag_parnets(tags_raw, num_tags, tag_model, DEVICE_UNIT)
+        pred = unified_model(parnet_noisy, tag_parnets, noise)
+        loss1 = difference_loss(pred, parnet_clean)
+        loss1.backward()
+        grads_unified = {name: param.grad.clone().cpu() for name, param in unified_model.named_parameters() if param.grad is not None}
+        tag_model.zero_grad(); unified_model.zero_grad()
+        l1 = loss1.item()
+
+        # --- Фаза 2: ParNetTag ---
+        for p in tag_model.parameters():
+            p.requires_grad = True
+        for p in unified_model.parameters():
+            p.requires_grad = False
 
         tag_parnets = compute_tag_parnets(tags_raw, num_tags, tag_model, DEVICE_UNIT)
         pred = unified_model(parnet_noisy, tag_parnets, noise)
-        loss = difference_loss(pred, parnet_clean)
-        loss.backward()
+        loss2 = difference_loss(pred, parnet_clean)
+        loss2.backward()
+        grads_tag = {name: param.grad.clone().cpu() for name, param in tag_model.named_parameters() if param.grad is not None}
+        tag_model.zero_grad(); unified_model.zero_grad()
+        l2 = loss2.item()
 
-        opt_tag.step()
-        opt_unified.step()
+        # Применяем градиенты
+        for name, param in unified_model.named_parameters():
+            param.grad = grads_unified[name].to(param.device) if name in grads_unified else None
+        opt_unified.step(); opt_unified.zero_grad()
 
-        total_loss_epoch += loss.item()
-        print(f"Batch {batch_idx+1}/{n_batches} | Loss: {loss.item():.6f}")
+        for name, param in tag_model.named_parameters():
+            param.grad = grads_tag[name].to(param.device) if name in grads_tag else None
+        opt_tag.step(); opt_tag.zero_grad()
+
+        total_loss_epoch += l1 + l2
+        print(f"Batch {batch_idx+1}/{n_batches} | Ph1(Unified):{l1:.6f} Ph2(Tag):{l2:.6f}")
 
         if cfg.CLEAR_CACHE_EACH_BATCH and torch.cuda.is_available():
             torch.cuda.empty_cache()
             gc.collect()
 
-    return total_loss_epoch / n_batches
+    return total_loss_epoch / (2 * n_batches)
 
 # ---------------------- Сбор данных для валидации ----------------------
 def collect_validation_examples(tag_model, unified_model, val_loader, num_examples):
@@ -263,6 +307,7 @@ def collect_validation_examples(tag_model, unified_model, val_loader, num_exampl
                 examples.append({
                     'id': ex_id,
                     'orig': parnet_clean[i].cpu(),
+                    'noisy': parnet_noisy[i].cpu(),
                     'pred': pred[i].cpu(),
                     'loss': ex_loss,
                     'psnr': ex_psnr
@@ -272,13 +317,26 @@ def collect_validation_examples(tag_model, unified_model, val_loader, num_exampl
     avg_psnr = sum_psnr / n_batches
     return avg_loss, avg_psnr, examples
 
+# ---------------------- Сохранение примера ----------------------
+def save_example_images(base_dir, ex, decompressor, decoder):
+    os.makedirs(base_dir, exist_ok=True)
+
+    orig_img = compressed_parnet_to_pil(ex['orig'], decompressor, decoder)
+    orig_img.save(os.path.join(base_dir, "original_decoded.png"))
+
+    pred_img = compressed_parnet_to_pil(ex['pred'], decompressor, decoder)
+    pred_img.save(os.path.join(base_dir, "predicted_decoded.png"))
+    diff_pred = np.abs(np.array(orig_img).astype(np.float32) - np.array(pred_img).astype(np.float32)).astype(np.uint8)
+    Image.fromarray(diff_pred).save(os.path.join(base_dir, "difference_predicted_decoded.png"))
+
+    with open(os.path.join(base_dir, "metrics.txt"), 'w') as f:
+        f.write(f"Loss: {ex['loss']:.6f}\nPSNR: {ex['psnr']:.2f} dB\n")
+
 # ---------------------- Валидация ----------------------
-def run_validation(tag_model, unified_model, val_loader, epoch, models_dir,
-                   opt_tag, opt_unified, decoder, decompressor):
+def run_validation_tag_unit(tag_model, unified_model, val_loader, epoch, models_dir,
+                            opt_tag, opt_unified, decoder, decompressor):
     num_examples = cfg.NUM_TEST_EXAMPLES
-    avg_loss, avg_psnr, examples = collect_validation_examples(
-        tag_model, unified_model, val_loader, num_examples
-    )
+    avg_loss, avg_psnr, examples = collect_validation_examples(tag_model, unified_model, val_loader, num_examples)
     print(f"Validation Epoch {epoch}: Loss={avg_loss:.6f}, PSNR={avg_psnr:.2f} dB")
 
     if not examples or decompressor is None or decoder is None:
@@ -287,13 +345,16 @@ def run_validation(tag_model, unified_model, val_loader, epoch, models_dir,
         tag_model.train(); unified_model.train()
         return avg_loss, avg_psnr, tag_model, unified_model, opt_tag, opt_unified
 
-    print("Данные для валидации собраны. Выгружаю обучающие модели...")
+    print("Данные для валидации собраны и перенесены в RAM. Выгружаю обучающие модели...")
 
     temp_paths = []
     for name, model, opt in [("tag", tag_model, opt_tag), ("unified", unified_model, opt_unified)]:
         path = os.path.join(models_dir, f"temp_val_{name}_restore.pt")
-        torch.save({'epoch': epoch, 'model_state_dict': model.state_dict(),
-                    'optimizer_state_dict': opt.state_dict()}, path)
+        torch.save({
+            'epoch': epoch,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': opt.state_dict(),
+        }, path)
         temp_paths.append(path)
 
     del tag_model, unified_model, opt_tag, opt_unified
@@ -301,24 +362,10 @@ def run_validation(tag_model, unified_model, val_loader, epoch, models_dir,
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    # Визуализация
     for ex in examples:
         base_dir = os.path.join(cfg.VAL_TESTS_DIR, f"epoch_{epoch}", f"example_{ex['id']}")
-        os.makedirs(base_dir, exist_ok=True)
+        save_example_images(base_dir, ex, decompressor, decoder)
 
-        orig_img = compressed_parnet_to_pil(ex['orig'], decompressor, decoder)
-        orig_img.save(os.path.join(base_dir, "original_decoded.png"))
-
-        pred_img = compressed_parnet_to_pil(ex['pred'], decompressor, decoder)
-        pred_img.save(os.path.join(base_dir, "predicted_decoded.png"))
-
-        diff_pred = np.abs(np.array(orig_img).astype(np.float32) - np.array(pred_img).astype(np.float32)).astype(np.uint8)
-        Image.fromarray(diff_pred).save(os.path.join(base_dir, "difference_predicted_decoded.png"))
-
-        with open(os.path.join(base_dir, "metrics.txt"), 'w') as f:
-            f.write(f"Loss: {ex['loss']:.6f}\nPSNR: {ex['psnr']:.2f} dB\n")
-
-    # Восстановление моделей
     tag_model = ParNetTag().to(DEVICE_TAG)
     unified_model = UnifiedUnitParnet().to(DEVICE_UNIT)
     opt_tag = optim.Adam(tag_model.parameters(), lr=cfg.LEARNING_RATE)
@@ -366,6 +413,7 @@ def collect_test_examples(tag_model, unified_model, dataset, num_examples):
         examples.append({
             'id': example_id,
             'orig': parnet.squeeze(0).cpu(),
+            'noisy': noisy_parnet.squeeze(0).cpu(),
             'pred': pred.squeeze(0).cpu(),
             'loss': loss,
             'psnr': psnr_val
@@ -374,8 +422,8 @@ def collect_test_examples(tag_model, unified_model, dataset, num_examples):
     return examples
 
 # ---------------------- Тестирование ----------------------
-def run_tests(tag_model, unified_model, train_dataset, epoch, models_dir,
-              opt_tag, opt_unified, decoder, decompressor):
+def run_tests_tag_unit(tag_model, unified_model, train_dataset, epoch, models_dir,
+                       opt_tag, opt_unified, decoder, decompressor):
     num_examples = cfg.NUM_TEST_EXAMPLES
     examples = collect_test_examples(tag_model, unified_model, train_dataset, num_examples)
     if not examples or decompressor is None or decoder is None:
@@ -384,13 +432,16 @@ def run_tests(tag_model, unified_model, train_dataset, epoch, models_dir,
         tag_model.train(); unified_model.train()
         return tag_model, unified_model, opt_tag, opt_unified
 
-    print("Тестовые данные собраны. Выгружаю обучающие модели...")
+    print("Тестовые данные собраны и находятся в RAM. Выгружаю обучающие модели...")
 
     temp_paths = []
     for name, model, opt in [("tag", tag_model, opt_tag), ("unified", unified_model, opt_unified)]:
         path = os.path.join(models_dir, f"temp_test_{name}_restore.pt")
-        torch.save({'epoch': epoch, 'model_state_dict': model.state_dict(),
-                    'optimizer_state_dict': opt.state_dict()}, path)
+        torch.save({
+            'epoch': epoch,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': opt.state_dict(),
+        }, path)
         temp_paths.append(path)
 
     del tag_model, unified_model, opt_tag, opt_unified
@@ -400,21 +451,8 @@ def run_tests(tag_model, unified_model, train_dataset, epoch, models_dir,
 
     for ex in examples:
         base_dir = os.path.join(cfg.TESTS_DIR, f"epoch_{epoch}", f"example_{ex['id']}")
-        os.makedirs(base_dir, exist_ok=True)
+        save_example_images(base_dir, ex, decompressor, decoder)
 
-        orig_img = compressed_parnet_to_pil(ex['orig'], decompressor, decoder)
-        orig_img.save(os.path.join(base_dir, "original_decoded.png"))
-
-        pred_img = compressed_parnet_to_pil(ex['pred'], decompressor, decoder)
-        pred_img.save(os.path.join(base_dir, "predicted_decoded.png"))
-
-        diff_pred = np.abs(np.array(orig_img).astype(np.float32) - np.array(pred_img).astype(np.float32)).astype(np.uint8)
-        Image.fromarray(diff_pred).save(os.path.join(base_dir, "difference_predicted_decoded.png"))
-
-        with open(os.path.join(base_dir, "metrics.txt"), 'w') as f:
-            f.write(f"Loss: {ex['loss']:.6f}\nPSNR: {ex['psnr']:.2f} dB\n")
-
-    # Восстановление моделей
     tag_model = ParNetTag().to(DEVICE_TAG)
     unified_model = UnifiedUnitParnet().to(DEVICE_UNIT)
     opt_tag = optim.Adam(tag_model.parameters(), lr=cfg.LEARNING_RATE)
@@ -472,19 +510,23 @@ def train():
 
     for epoch in range(start_epoch, cfg.NUM_EPOCHS + 1):
         print(f"\n--- Epoch {epoch} ---")
-        avg_loss = train_epoch_tag_unit(tag_model, unified_model, train_loader, opt_tag, opt_unified)
-        print(f"Epoch {epoch:3d} Average Loss: {avg_loss:.6f}")
+        avg_total = train_epoch_tag_unit(tag_model, unified_model, train_loader, opt_tag, opt_unified)
+        print(f"Epoch {epoch:3d} Average Total: {avg_total:.6f}")
 
         if val_loader and epoch % cfg.VAL_EVERY_EPOCHS == 0:
             val_loss, val_psnr, tag_model, unified_model, opt_tag, opt_unified = \
-                run_validation(tag_model, unified_model, val_loader, epoch, models_dir,
-                               opt_tag, opt_unified, decoder, decompressor)
+                run_validation_tag_unit(
+                    tag_model, unified_model, val_loader, epoch, models_dir,
+                    opt_tag, opt_unified, decoder, decompressor
+                )
 
         if epoch % cfg.TEST_EVERY_EPOCHS == 0:
             print(f"Running tests for epoch {epoch}...")
             tag_model, unified_model, opt_tag, opt_unified = \
-                run_tests(tag_model, unified_model, train_dataset, epoch, models_dir,
-                          opt_tag, opt_unified, decoder, decompressor)
+                run_tests_tag_unit(
+                    tag_model, unified_model, train_dataset, epoch, models_dir,
+                    opt_tag, opt_unified, decoder, decompressor
+                )
 
         if epoch % cfg.SAVE_EVERY_EPOCHS == 0:
             save_checkpoints(epoch, tag_model, opt_tag, unified_model, opt_unified, models_dir)

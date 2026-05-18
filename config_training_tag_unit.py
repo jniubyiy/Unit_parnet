@@ -1,41 +1,41 @@
 # config_training_tag_unit.py
 """
-Конфигурация для обучения моделей tag и UnifiedUnitParnet (единая модель).
+Конфигурация для обучения моделей tag, unified_unit.
 """
 
 # ======================== ParNetTag =============================
 TAG_MODEL_HIDDEN_DIM = 256
 TAG_MODEL_NUM_LAYERS = 3
-TAG_MODEL_DROPOUT = 0.1          # dropout между слоями MLP
+TAG_MODEL_DROPOUT = 0.1          # dropout между слоями MLP (0 = без dropout)
 
-# ======================== UnifiedUnitParnet ======================
-# Входо‑выходные каналы сжатого парнета
-UNIT_IN_CHANNELS = 4
-UNIT_OUT_CHANNELS = 4
+# ======================== UnifiedUnitParnet =====================
+UNIFIED_IN_CHANNELS = 4
+UNIFIED_OUT_CHANNELS = 4
 
-# Текстовая ветвь (поиск «что сохранить»)
-UNIT_TXT_FEAT_HIDDEN = 64
-UNIT_TXT_FEAT_LAYERS = 2
-UNIT_TXT_FEAT_DROPOUT = 0.0
+# Текстовая ветвь (поиск «что нельзя удалять»)
+UNIFIED_TXT_FEAT_HIDDEN = 64
+UNIFIED_TXT_FEAT_LAYERS = 2
+UNIFIED_TXT_FEAT_DROPOUT = 0.0
 
-UNIT_TXT_ENCODER_HIDDEN = 64
-UNIT_TXT_ENCODER_DROPOUT = 0.0
+UNIFIED_TXT_ENCODER_HIDDEN = 64
+UNIFIED_TXT_ENCODER_DROPOUT = 0.0
 
-UNIT_ATTN_DROPOUT = 0.0
+UNIFIED_ATTENTION_DROPOUT = 0.0
 
-# Шумовая ветвь (поиск «что удалить»)
-UNIT_NOISE_ENC_HIDDEN = 32
-UNIT_NOISE_ENC_LAYERS = 2
-UNIT_NOISE_ENC_DROPOUT = 0.0
+# Шумовая ветвь (поиск «что нужно удалить»)
+UNIFIED_NOISE_ENC_HIDDEN = 32
+UNIFIED_NOISE_ENC_LAYERS = 2
+UNIFIED_NOISE_ENC_DROPOUT = 0.0
 
-# Объединение и выход
-UNIT_FUSION_HIDDEN = 32
-UNIT_FUSION_LAYERS = 2
-UNIT_FUSION_DROPOUT = 0.0
+# Объединение признаков
+UNIFIED_FUSION_HIDDEN = 32
+UNIFIED_FUSION_LAYERS = 2
+UNIFIED_FUSION_DROPOUT = 0.0
 
-UNIT_RESIDUAL_HIDDEN = 32
-UNIT_RESIDUAL_LAYERS = 2
-UNIT_RESIDUAL_DROPOUT = 0.0
+# Предсказание остаточного шума
+UNIFIED_RESIDUAL_HIDDEN = 32
+UNIFIED_RESIDUAL_LAYERS = 2
+UNIFIED_RESIDUAL_DROPOUT = 0.0
 
 # ─── Данные ───────────────────────────────────────────────────────
 DATASET_DIR_TAG = "./prepared_dataset_tag_image"  # папка с .pt и .txt
