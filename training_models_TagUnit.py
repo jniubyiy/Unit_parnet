@@ -1,5 +1,4 @@
 # training_models_TagUnit.py
-
 import os, re, glob, math, random, gc
 import torch
 import torch.nn.functional as F
@@ -7,38 +6,42 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from PIL import Image
 import numpy as np
-
 from model_parnet_tag import ParNetTag
 from model_Unit_parnet_1 import UnitParnet1
 from model_Unit_parnet_2 import UnitParnet2
-
 import config_training_tag_unit as cfg
 
 # ---------------------- Устройства ----------------------
-DEVICE_TAG   = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+DEVICE_TAG = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 DEVICE_UNIT1 = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 DEVICE_UNIT2 = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 DEVICE_DECODER = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
 print(f"Devices – Tag: {DEVICE_TAG}, Unit1: {DEVICE_UNIT1}, Unit2: {DEVICE_UNIT2}")
 
 # ---------------------- Датасет ----------------------
 class ParnetTagDataset(Dataset):
-    """Загружает парнеты и теги из папки: файлы <id>.pt и <id>.txt"""
+    """
+    Загружает сжатые парнеты (parnet_compressed) и теги из папки.
+    Формат .pt файла: {'parnet_compressed': тензор [C, H//2, W//2]}.
+    Имена файлов могут содержать любые символы.
+    """
     def __init__(self, root_dir):
         self.root_dir = root_dir
         self.pt_files = {}
         self.txt_files = {}
+
         all_pts = glob.glob(os.path.join(root_dir, "*.pt"))
         for pt_path in all_pts:
             fname = os.path.splitext(os.path.basename(pt_path))[0]
             self.pt_files[fname] = pt_path
+
         all_txts = glob.glob(os.path.join(root_dir, "*.txt"))
         for txt_path in all_txts:
             fname = os.path.splitext(os.path.basename(txt_path))[0]
             self.txt_files[fname] = txt_path
+
         common_keys = sorted(set(self.pt_files.keys()) & set(self.txt_files.keys()),
-                             key=lambda x: int(x) if x.isdigit() else x)
+                             key=lambda x: x)
         self.keys = common_keys
         if not self.keys:
             raise RuntimeError(f"No matching .pt and .txt pairs in {root_dir}")
@@ -49,15 +52,17 @@ class ParnetTagDataset(Dataset):
     def __getitem__(self, idx):
         key = self.keys[idx]
         data = torch.load(self.pt_files[key], map_location='cpu', weights_only=False)
-        parnet = data['parnet']  # [3, H, W] в [-1,1]
+        parnet_compressed = data['parnet_compressed']   # [C, H//2, W//2]
+
         with open(self.txt_files[key], 'r', encoding='utf-8') as f:
             raw_line = f.read().strip()
-        if raw_line:
-            tags = [tag.strip() for tag in raw_line.split(',') if tag.strip()]
-        else:
-            tags = []
+            if raw_line:
+                tags = [tag.strip() for tag in raw_line.split(',') if tag.strip()]
+            else:
+                tags = []
+
         return {
-            'parnet': parnet,
+            'parnet_compressed': parnet_compressed,
             'tags': tags,
             'example_id': key
         }
@@ -71,6 +76,7 @@ def encode_tags(tags_list, max_len=32, byte_len=128, pad_byte=0):
             tag_bytes = tag_bytes + bytes([pad_byte] * (byte_len - len(tag_bytes)))
         tag_tensor = torch.tensor(list(tag_bytes), dtype=torch.float32)
         encoded.append(tag_tensor)
+
     if len(encoded) == 0:
         encoded.append(torch.zeros(byte_len))
     if len(encoded) > max_len:
@@ -78,7 +84,7 @@ def encode_tags(tags_list, max_len=32, byte_len=128, pad_byte=0):
     else:
         while len(encoded) < max_len:
             encoded.append(torch.zeros(byte_len))
-    return torch.stack(encoded, dim=0)   # [max_len, byte_len]
+    return torch.stack(encoded, dim=0)  # [max_len, byte_len]
 
 # ---------------------- Коллат-функция ----------------------
 def collate_tag_fn(batch):
@@ -89,17 +95,18 @@ def collate_tag_fn(batch):
     num_tags_list = []
 
     for item in batch:
-        parnet = item['parnet']
+        parnet = item['parnet_compressed']       # [C, Hc, Wc]
         tags = item['tags']
         example_id = item['example_id']
 
-        seed = cfg.NOISE_SEED + int(example_id) if example_id.isdigit() else cfg.NOISE_SEED
+        seed = hash(example_id) % (2**31)
         g = torch.Generator()
         g.manual_seed(seed)
         noise = torch.randn(parnet.shape, generator=g) * cfg.NOISE_STD
 
         tags_tensor = encode_tags(tags, max_len=cfg.TAG_SEQ_MAX_LEN,
-                                  byte_len=cfg.TAG_BYTE_LEN, pad_byte=cfg.PAD_BYTE_VALUE)
+                                  byte_len=cfg.TAG_BYTE_LEN,
+                                  pad_byte=cfg.PAD_BYTE_VALUE)
         num_real = min(len(tags), cfg.TAG_SEQ_MAX_LEN) if tags else 1
 
         parnets.append(parnet)
@@ -108,10 +115,10 @@ def collate_tag_fn(batch):
         example_ids.append(example_id)
         num_tags_list.append(num_real)
 
-    parnet_clean = torch.stack(parnets, dim=0)
+    parnet_clean = torch.stack(parnets, dim=0)            # [B, C, Hc, Wc]
     parnet_noisy = parnet_clean + torch.stack(noises, dim=0)
-    noise_batch = torch.stack(noises, dim=0)
-    tags_batch = torch.stack(tags_batch, dim=0)          # [B, 32, 128]
+    noise_batch = torch.stack(noises, dim=0)              # [B, C, Hc, Wc]
+    tags_batch = torch.stack(tags_batch, dim=0)           # [B, 32, 128]
     num_tags_tensor = torch.tensor(num_tags_list, dtype=torch.long)
 
     return {
@@ -135,12 +142,13 @@ def compute_psnr(pred, target):
 
 # ---------------------- Подготовка tag_parnets ----------------------
 def compute_tag_parnets(tags_raw, num_tags, tag_model, device):
-    """Преобразует теги в tag_parnets [B, 128, 32] на указанном устройстве."""
     B, max_len, byte_len = tags_raw.shape
+
     real_tags_list = []
     for i in range(B):
         n = num_tags[i].item()
         real_tags_list.append(tags_raw[i, :n])
+
     if real_tags_list:
         real_tags_batch = torch.cat(real_tags_list, dim=0).to(device)
     else:
@@ -160,10 +168,10 @@ def compute_tag_parnets(tags_raw, num_tags, tag_model, device):
             idx += n
     return tag_parnets
 
-# ---------------------- Один временной шаг (без tag_model) ----------------------
-def forward_step_with_tag_parnets(tag_parnets, parnet_input, noise, t_step_tensor, unit1, unit2):
-    enriched = unit1(parnet_input, tag_parnets, t_step_tensor)
-    pred = unit2(enriched, noise, t_step_tensor)
+# ---------------------- Один прямой проход ----------------------
+def forward_once(tag_parnets, parnet_input, noise, unit1, unit2):
+    enriched = unit1(parnet_input, tag_parnets)
+    pred = unit2(enriched, noise)
     return pred, enriched
 
 # ---------------------- Чекпоинты ----------------------
@@ -194,7 +202,9 @@ def cleanup_old_checkpoints(models_dir, keep=cfg.MAX_CHECKPOINTS):
 
 def save_checkpoints(epoch, tag_model, opt_tag, unit1, opt_unit1, unit2, opt_unit2, models_dir):
     os.makedirs(models_dir, exist_ok=True)
-    for name, model, opt in [("tag", tag_model, opt_tag), ("unit1", unit1, opt_unit1), ("unit2", unit2, opt_unit2)]:
+    for name, model, opt in [("tag", tag_model, opt_tag),
+                              ("unit1", unit1, opt_unit1),
+                              ("unit2", unit2, opt_unit2)]:
         torch.save({
             'epoch': epoch,
             'model_state_dict': model.state_dict(),
@@ -204,7 +214,9 @@ def save_checkpoints(epoch, tag_model, opt_tag, unit1, opt_unit1, unit2, opt_uni
 
 def load_checkpoints_if_exist(tag_model, opt_tag, unit1, opt_unit1, unit2, opt_unit2, models_dir):
     loaded_epoch = 0
-    for name, model, opt in [("tag", tag_model, opt_tag), ("unit1", unit1, opt_unit1), ("unit2", unit2, opt_unit2)]:
+    for name, model, opt in [("tag", tag_model, opt_tag),
+                              ("unit1", unit1, opt_unit1),
+                              ("unit2", unit2, opt_unit2)]:
         path, epoch = find_latest_checkpoint(name, models_dir)
         if path:
             ckpt = torch.load(path, map_location='cpu', weights_only=False)
@@ -217,7 +229,7 @@ def load_checkpoints_if_exist(tag_model, opt_tag, unit1, opt_unit1, unit2, opt_u
                 assert epoch == loaded_epoch, f"Epoch mismatch for {name}"
     return loaded_epoch
 
-# ---------------------- Загрузка декодера ----------------------
+# ---------------------- Загрузка инференс-моделей ----------------------
 def load_inference_decoder(decoder_path):
     if not os.path.exists(decoder_path):
         return None
@@ -225,72 +237,23 @@ def load_inference_decoder(decoder_path):
     model.eval()
     return model
 
-# ---------------------- Визуализация ----------------------
-def parnet_to_pil(t):
-    arr = (t.clamp(-1, 1).cpu().numpy() + 1) / 2 * 255
-    arr = np.transpose(arr, (1, 2, 0)).astype(np.uint8)
-    return Image.fromarray(arr)
+def load_inference_decompressor(decompressor_path):
+    if not os.path.exists(decompressor_path):
+        return None
+    model = torch.jit.load(decompressor_path, map_location=DEVICE_DECODER)
+    model.eval()
+    return model
 
-def save_example_images(base_dir, example_id,
-                        original_parnet=None, predicted_parnet=None,
-                        noisy_parnet=None, enriched_parnet=None,
-                        loss_val=None, psnr_val=None, decoder=None,
-                        step=None, max_steps=None, save_original=True):
-    os.makedirs(base_dir, exist_ok=True)
-    suffix = f"_step{step}" if step is not None else ""
-
-    # Оригинал (RGB) – только если save_original и original_parnet передан
-    if original_parnet is not None and save_original:
-        parnet_to_pil(original_parnet).save(os.path.join(base_dir, f"{example_id}_original_parnet.png"))
-
-    # Предсказание (RGB) – только если predicted_parnet передан
-    if predicted_parnet is not None:
-        parnet_to_pil(predicted_parnet).save(os.path.join(base_dir, f"{example_id}{suffix}_predicted_parnet.png"))
-        if original_parnet is not None:
-            diff_parnet = (predicted_parnet - original_parnet).abs()
-            parnet_to_pil(diff_parnet).save(os.path.join(base_dir, f"{example_id}{suffix}_difference_parnet.png"))
-
-    # Noisy (только один раз)
-    if noisy_parnet is not None and (step is None or step == 1):
-        parnet_to_pil(noisy_parnet).save(os.path.join(base_dir, f"{example_id}_noisy_parnet.png"))
-
-    # Enriched (для каждого шага, если передан)
-    if enriched_parnet is not None:
-        parnet_to_pil(enriched_parnet).save(os.path.join(base_dir, f"{example_id}{suffix}_enriched_parnet.png"))
-
-    # Декодированные изображения
-    if decoder is not None:
-        with torch.no_grad():
-            # Декодированный оригинал (один раз)
-            if original_parnet is not None and save_original and (step is None or step == 1):
-                orig_dec = decoder(original_parnet.unsqueeze(0).to(DEVICE_DECODER)).squeeze(0).cpu()
-                parnet_to_pil(orig_dec).save(os.path.join(base_dir, f"{example_id}_original_decoded.png"))
-
-            # Декодированное предсказание (если есть predicted_parnet)
-            if predicted_parnet is not None:
-                pred_dec = decoder(predicted_parnet.unsqueeze(0).to(DEVICE_DECODER)).squeeze(0).cpu()
-                parnet_to_pil(pred_dec).save(os.path.join(base_dir, f"{example_id}{suffix}_predicted_decoded.png"))
-                if original_parnet is not None:
-                    # Для разницы нужен оригинал; вычисляем его один раз (если ещё не вычислен) или повторно
-                    orig_dec_for_diff = decoder(original_parnet.unsqueeze(0).to(DEVICE_DECODER)).squeeze(0).cpu()
-                    diff_dec = (pred_dec - orig_dec_for_diff).abs()
-                    parnet_to_pil(diff_dec).save(os.path.join(base_dir, f"{example_id}{suffix}_difference_decoded.png"))
-
-            # Декодированный шумный (один раз)
-            if noisy_parnet is not None and (step is None or step == 1):
-                noisy_dec = decoder(noisy_parnet.unsqueeze(0).to(DEVICE_DECODER)).squeeze(0).cpu()
-                parnet_to_pil(noisy_dec).save(os.path.join(base_dir, f"{example_id}_noisy_decoded.png"))
-
-            # Декодированный enriched
-            if enriched_parnet is not None:
-                enriched_dec = decoder(enriched_parnet.unsqueeze(0).to(DEVICE_DECODER)).squeeze(0).cpu()
-                parnet_to_pil(enriched_dec).save(os.path.join(base_dir, f"{example_id}{suffix}_enriched_decoded.png"))
-
-    # Метрики только для последнего шага или если шаг не указан
-    if loss_val is not None and psnr_val is not None:
-        if step is None or (max_steps is not None and step == max_steps):
-            with open(os.path.join(base_dir, f"{example_id}_metrics.txt"), 'w') as f:
-                f.write(f"Loss: {loss_val:.6f}\nPSNR: {psnr_val:.2f} dB\n")
+# ---------------------- Утилита конвертации одного сжатого парнета в PIL ----------------------
+def compressed_parnet_to_pil(compressed_parnet, decompressor, decoder):
+    with torch.no_grad():
+        x = compressed_parnet.unsqueeze(0).to(DEVICE_DECODER)
+        full_parnet = decompressor(x)
+        rgb = decoder(full_parnet)
+        rgb = rgb.squeeze(0).cpu()
+        arr = (rgb.clamp(-1, 1) + 1) / 2 * 255
+        arr = arr.permute(1, 2, 0).to(torch.uint8).numpy()
+        return Image.fromarray(arr)
 
 # ---------------------- Тренировочная эпоха ----------------------
 def train_epoch_tag_unit(tag_model, unit1, unit2, train_loader, opt_tag, opt_unit1, opt_unit2):
@@ -299,7 +262,6 @@ def train_epoch_tag_unit(tag_model, unit1, unit2, train_loader, opt_tag, opt_uni
     unit2.train()
     total_loss_epoch = 0.0
     n_batches = len(train_loader)
-    max_steps = cfg.MAX_TIME_STEPS
 
     for batch_idx, batch in enumerate(train_loader):
         parnet_clean = batch['parnet_clean'].to(DEVICE_UNIT2)
@@ -314,22 +276,18 @@ def train_epoch_tag_unit(tag_model, unit1, unit2, train_loader, opt_tag, opt_uni
         grads_unit2 = {}
 
         # --- Фаза 1: unit2 ---
-        for p in tag_model.parameters(): p.requires_grad = False
-        for p in unit1.parameters(): p.requires_grad = False
-        for p in unit2.parameters(): p.requires_grad = True
+        for p in tag_model.parameters():
+            p.requires_grad = False
+        for p in unit1.parameters():
+            p.requires_grad = False
+        for p in unit2.parameters():
+            p.requires_grad = True
 
         with torch.no_grad():
             tag_parnets = compute_tag_parnets(tags_raw, num_tags, tag_model, DEVICE_UNIT2)
-
-        loss_phase1 = 0.0
-        pred = None
-        for step in range(1, max_steps+1):
-            input_parnet = parnet_noisy if step == 1 else pred
-            t_tensor = torch.full((B,), step, device=DEVICE_UNIT2, dtype=torch.float32)
-            pred, _ = forward_step_with_tag_parnets(tag_parnets, input_parnet, noise, t_tensor, unit1, unit2)
-            loss_phase1 += difference_loss(pred, parnet_clean)
+        pred, _ = forward_once(tag_parnets, parnet_noisy, noise, unit1, unit2)
+        loss_phase1 = difference_loss(pred, parnet_clean)
         loss_phase1.backward()
-
         for name, param in unit2.named_parameters():
             if param.grad is not None:
                 grads_unit2[name] = param.grad.clone().cpu()
@@ -337,22 +295,18 @@ def train_epoch_tag_unit(tag_model, unit1, unit2, train_loader, opt_tag, opt_uni
         l1 = loss_phase1.item()
 
         # --- Фаза 2: unit1 ---
-        for p in tag_model.parameters(): p.requires_grad = False
-        for p in unit1.parameters(): p.requires_grad = True
-        for p in unit2.parameters(): p.requires_grad = False
+        for p in tag_model.parameters():
+            p.requires_grad = False
+        for p in unit1.parameters():
+            p.requires_grad = True
+        for p in unit2.parameters():
+            p.requires_grad = False
 
         with torch.no_grad():
             tag_parnets = compute_tag_parnets(tags_raw, num_tags, tag_model, DEVICE_UNIT2)
-
-        loss_phase2 = 0.0
-        pred = None
-        for step in range(1, max_steps+1):
-            input_parnet = parnet_noisy if step == 1 else pred
-            t_tensor = torch.full((B,), step, device=DEVICE_UNIT2, dtype=torch.float32)
-            pred, _ = forward_step_with_tag_parnets(tag_parnets, input_parnet, noise, t_tensor, unit1, unit2)
-            loss_phase2 += difference_loss(pred, parnet_clean)
+        pred, _ = forward_once(tag_parnets, parnet_noisy, noise, unit1, unit2)
+        loss_phase2 = difference_loss(pred, parnet_clean)
         loss_phase2.backward()
-
         for name, param in unit1.named_parameters():
             if param.grad is not None:
                 grads_unit1[name] = param.grad.clone().cpu()
@@ -360,28 +314,24 @@ def train_epoch_tag_unit(tag_model, unit1, unit2, train_loader, opt_tag, opt_uni
         l2 = loss_phase2.item()
 
         # --- Фаза 3: tag_model ---
-        for p in tag_model.parameters(): p.requires_grad = True
-        for p in unit1.parameters(): p.requires_grad = False
-        for p in unit2.parameters(): p.requires_grad = False
+        for p in tag_model.parameters():
+            p.requires_grad = True
+        for p in unit1.parameters():
+            p.requires_grad = False
+        for p in unit2.parameters():
+            p.requires_grad = False
 
         tag_parnets = compute_tag_parnets(tags_raw, num_tags, tag_model, DEVICE_UNIT2)
-
-        loss_phase3 = 0.0
-        pred = None
-        for step in range(1, max_steps+1):
-            input_parnet = parnet_noisy if step == 1 else pred
-            t_tensor = torch.full((B,), step, device=DEVICE_UNIT2, dtype=torch.float32)
-            pred, _ = forward_step_with_tag_parnets(tag_parnets, input_parnet, noise, t_tensor, unit1, unit2)
-            loss_phase3 += difference_loss(pred, parnet_clean)
+        pred, _ = forward_once(tag_parnets, parnet_noisy, noise, unit1, unit2)
+        loss_phase3 = difference_loss(pred, parnet_clean)
         loss_phase3.backward()
-
         for name, param in tag_model.named_parameters():
             if param.grad is not None:
                 grads_tag[name] = param.grad.clone().cpu()
         tag_model.zero_grad(); unit1.zero_grad(); unit2.zero_grad()
         l3 = loss_phase3.item()
 
-        # Применение накопленных градиентов
+        # Применение градиентов
         for name, param in unit2.named_parameters():
             param.grad = grads_unit2[name].to(param.device) if name in grads_unit2 else None
         opt_unit2.step(); opt_unit2.zero_grad(); grads_unit2.clear()
@@ -403,13 +353,11 @@ def train_epoch_tag_unit(tag_model, unit1, unit2, train_loader, opt_tag, opt_uni
 
     return total_loss_epoch / (3 * n_batches)
 
-# ---------------------- Валидация ----------------------
-def run_validation_tag_unit(tag_model, unit1, unit2, val_loader, epoch, models_dir,
-                            opt_tag, opt_unit1, opt_unit2, decoder=None):
+# ---------------------- Сбор данных для валидации ----------------------
+def collect_validation_examples(tag_model, unit1, unit2, val_loader, num_examples):
     tag_model.eval(); unit1.eval(); unit2.eval()
     sum_loss = 0.0; sum_psnr = 0.0; n_batches = 0
     examples = []
-    max_steps = cfg.MAX_TIME_STEPS
 
     with torch.no_grad():
         for batch in val_loader:
@@ -421,223 +369,207 @@ def run_validation_tag_unit(tag_model, unit1, unit2, val_loader, epoch, models_d
             B = parnet_clean.size(0)
 
             tag_parnets = compute_tag_parnets(tags_raw, num_tags, tag_model, DEVICE_UNIT2)
+            pred, enriched = forward_once(tag_parnets, parnet_noisy, noise, unit1, unit2)
 
-            if len(examples) < cfg.NUM_TEST_EXAMPLES:
-                preds_per_example = [[] for _ in range(B)]
-                enricheds_per_example = [[] for _ in range(B)]
-                pred = None
-                for step in range(1, max_steps+1):
-                    input_parnet = parnet_noisy if step == 1 else pred
-                    t_tensor = torch.full((B,), step, device=DEVICE_UNIT2, dtype=torch.float32)
-                    pred, enriched = forward_step_with_tag_parnets(tag_parnets, input_parnet, noise, t_tensor, unit1, unit2)
-                    for i in range(B):
-                        preds_per_example[i].append(pred[i].cpu())
-                        enricheds_per_example[i].append(enriched[i].cpu())
-                loss = difference_loss(pred, parnet_clean)
-                sum_loss += loss.item()
-                sum_psnr += compute_psnr(pred, parnet_clean)
-                n_batches += 1
-                for i in range(B):
-                    if len(examples) >= cfg.NUM_TEST_EXAMPLES: break
-                    ex_id = batch['example_ids'][i]
-                    examples.append({
-                        'id': ex_id,
-                        'orig': parnet_clean[i].cpu(),
-                        'noisy': parnet_noisy[i].cpu(),
-                        'preds': preds_per_example[i],
-                        'enricheds': enricheds_per_example[i],
-                        'loss': difference_loss(preds_per_example[i][-1].unsqueeze(0), parnet_clean[i].unsqueeze(0)).item(),
-                        'psnr': compute_psnr(preds_per_example[i][-1].unsqueeze(0), parnet_clean[i].unsqueeze(0))
-                    })
-            else:
-                pred = None
-                for step in range(1, max_steps+1):
-                    input_parnet = parnet_noisy if step == 1 else pred
-                    t_tensor = torch.full((B,), step, device=DEVICE_UNIT2, dtype=torch.float32)
-                    pred, _ = forward_step_with_tag_parnets(tag_parnets, input_parnet, noise, t_tensor, unit1, unit2)
-                loss = difference_loss(pred, parnet_clean)
-                sum_loss += loss.item()
-                sum_psnr += compute_psnr(pred, parnet_clean)
-                n_batches += 1
+            loss = difference_loss(pred, parnet_clean)
+            sum_loss += loss.item()
+            sum_psnr += compute_psnr(pred, parnet_clean)
+            n_batches += 1
+
+            for i in range(B):
+                if len(examples) >= num_examples:
+                    break
+                ex_id = batch['example_ids'][i]
+                ex_loss = difference_loss(pred[i].unsqueeze(0), parnet_clean[i].unsqueeze(0)).item()
+                ex_psnr = compute_psnr(pred[i].unsqueeze(0), parnet_clean[i].unsqueeze(0))
+                examples.append({
+                    'id': ex_id,
+                    'orig': parnet_clean[i].cpu(),
+                    'noisy': parnet_noisy[i].cpu(),
+                    'pred': pred[i].cpu(),
+                    'enriched': enriched[i].cpu(),
+                    'loss': ex_loss,
+                    'psnr': ex_psnr
+                })
 
     avg_loss = sum_loss / n_batches
     avg_psnr = sum_psnr / n_batches
+    return avg_loss, avg_psnr, examples
+
+# ---------------------- Конвертация и сохранение ----------------------
+def save_example_images(base_dir, ex, decompressor, decoder):
+    os.makedirs(base_dir, exist_ok=True)
+
+    orig_img = compressed_parnet_to_pil(ex['orig'], decompressor, decoder)
+    orig_img.save(os.path.join(base_dir, "original_decoded.png"))
+
+    pred_img = compressed_parnet_to_pil(ex['pred'], decompressor, decoder)
+    pred_img.save(os.path.join(base_dir, "predicted_decoded.png"))
+    diff_pred = np.abs(np.array(orig_img).astype(np.float32) - np.array(pred_img).astype(np.float32)).astype(np.uint8)
+    Image.fromarray(diff_pred).save(os.path.join(base_dir, "difference_predicted_decoded.png"))
+
+    enriched_img = compressed_parnet_to_pil(ex['enriched'], decompressor, decoder)
+    enriched_img.save(os.path.join(base_dir, "enriched_decoded.png"))
+    diff_enriched = np.abs(np.array(orig_img).astype(np.float32) - np.array(enriched_img).astype(np.float32)).astype(np.uint8)
+    Image.fromarray(diff_enriched).save(os.path.join(base_dir, "difference_enriched_decoded.png"))
+
+    with open(os.path.join(base_dir, "metrics.txt"), 'w') as f:
+        f.write(f"Loss: {ex['loss']:.6f}\nPSNR: {ex['psnr']:.2f} dB\n")
+
+# ---------------------- Валидация ----------------------
+def run_validation_tag_unit(tag_model, unit1, unit2, val_loader, epoch, models_dir,
+                            opt_tag, opt_unit1, opt_unit2, decoder, decompressor):
+    num_examples = cfg.NUM_TEST_EXAMPLES
+    avg_loss, avg_psnr, examples = collect_validation_examples(tag_model, unit1, unit2, val_loader, num_examples)
     print(f"Validation Epoch {epoch}: Loss={avg_loss:.6f}, PSNR={avg_psnr:.2f} dB")
 
-    if decoder is not None and examples:
-        temp_paths = []
-        for name, model, opt in [("tag", tag_model, opt_tag),
-                                 ("unit1", unit1, opt_unit1),
-                                 ("unit2", unit2, opt_unit2)]:
-            path = os.path.join(models_dir, f"temp_val_{name}_restore.pt")
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': opt.state_dict(),
-            }, path)
-            temp_paths.append(path)
-
-        del tag_model, unit1, unit2, opt_tag, opt_unit1, opt_unit2
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-        for ex in examples:
-            base_dir = os.path.join(cfg.VAL_TESTS_DIR, f"epoch_{epoch}", f"example_{ex['id']}")
-            # Базовый вызов: оригинал, шумный парнет, метрики (без predicted)
-            save_example_images(base_dir, ex['id'],
-                                original_parnet=ex['orig'],
-                                noisy_parnet=ex['noisy'],
-                                loss_val=ex['loss'], psnr_val=ex['psnr'],
-                                decoder=decoder, step=None, save_original=True)
-            # Для каждого временного шага: предсказание и enriched
-            for step in range(1, max_steps+1):
-                save_example_images(base_dir, ex['id'],
-                                    original_parnet=ex['orig'],
-                                    predicted_parnet=ex['preds'][step-1],
-                                    enriched_parnet=ex['enricheds'][step-1],
-                                    decoder=decoder, step=step, max_steps=max_steps,
-                                    save_original=False)
-
-        del decoder
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-        tag_model = ParNetTag(hidden_dim=cfg.TAG_MODEL_HIDDEN_DIM,
-                              num_layers=cfg.TAG_MODEL_NUM_LAYERS,
-                              activation=cfg.TAG_MODEL_ACTIVATION).to(DEVICE_TAG)
-        unit1 = UnitParnet1(hidden_dim=cfg.UNIT1_HIDDEN_DIM).to(DEVICE_UNIT1)
-        unit2 = UnitParnet2(hidden_dim=cfg.UNIT2_HIDDEN_DIM).to(DEVICE_UNIT2)
-        opt_tag = optim.Adam(tag_model.parameters(), lr=cfg.LEARNING_RATE)
-        opt_unit1 = optim.Adam(unit1.parameters(), lr=cfg.LEARNING_RATE)
-        opt_unit2 = optim.Adam(unit2.parameters(), lr=cfg.LEARNING_RATE)
-
-        for (name, model, opt), path in zip([("tag", tag_model, opt_tag),
-                                             ("unit1", unit1, opt_unit1),
-                                             ("unit2", unit2, opt_unit2)], temp_paths):
-            ckpt = torch.load(path, map_location='cpu', weights_only=False)
-            model.load_state_dict(ckpt['model_state_dict'])
-            opt.load_state_dict(ckpt['optimizer_state_dict'])
-            os.remove(path)
-
+    if not examples or decompressor is None or decoder is None:
+        if decompressor is None:
+            print("Визуализация пропущена: декомпрессор не загружен.")
         tag_model.train(); unit1.train(); unit2.train()
         return avg_loss, avg_psnr, tag_model, unit1, unit2, opt_tag, opt_unit1, opt_unit2
+
+    print("Данные для валидации собраны и перенесены в RAM. Выгружаю обучающие модели...")
+
+    # Сохраняем и выгружаем обучающие модели
+    temp_paths = []
+    for name, model, opt in [("tag", tag_model, opt_tag),
+                              ("unit1", unit1, opt_unit1),
+                              ("unit2", unit2, opt_unit2)]:
+        path = os.path.join(models_dir, f"temp_val_{name}_restore.pt")
+        torch.save({
+            'epoch': epoch,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': opt.state_dict(),
+        }, path)
+        temp_paths.append(path)
+
+    del tag_model, unit1, unit2, opt_tag, opt_unit1, opt_unit2
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    # Конвертация
+    for ex in examples:
+        base_dir = os.path.join(cfg.VAL_TESTS_DIR, f"epoch_{epoch}", f"example_{ex['id']}")
+        save_example_images(base_dir, ex, decompressor, decoder)
+
+    # Восстановление моделей
+    tag_model = ParNetTag().to(DEVICE_TAG)
+    unit1 = UnitParnet1().to(DEVICE_UNIT1)
+    unit2 = UnitParnet2().to(DEVICE_UNIT2)
+    opt_tag = optim.Adam(tag_model.parameters(), lr=cfg.LEARNING_RATE)
+    opt_unit1 = optim.Adam(unit1.parameters(), lr=cfg.LEARNING_RATE)
+    opt_unit2 = optim.Adam(unit2.parameters(), lr=cfg.LEARNING_RATE)
+
+    for (name, model, opt), path in zip([("tag", tag_model, opt_tag),
+                                          ("unit1", unit1, opt_unit1),
+                                          ("unit2", unit2, opt_unit2)], temp_paths):
+        ckpt = torch.load(path, map_location='cpu', weights_only=False)
+        model.load_state_dict(ckpt['model_state_dict'])
+        opt.load_state_dict(ckpt['optimizer_state_dict'])
+        os.remove(path)
 
     tag_model.train(); unit1.train(); unit2.train()
     return avg_loss, avg_psnr, tag_model, unit1, unit2, opt_tag, opt_unit1, opt_unit2
 
-# ---------------------- Тестирование ----------------------
-def run_tests_tag_unit(tag_model, unit1, unit2, train_dataset, epoch, models_dir,
-                       opt_tag, opt_unit1, opt_unit2, decoder=None):
+# ---------------------- Сбор данных для тестирования ----------------------
+def collect_test_examples(tag_model, unit1, unit2, dataset, num_examples):
     tag_model.eval(); unit1.eval(); unit2.eval()
-    max_steps = cfg.MAX_TIME_STEPS
     random.seed(cfg.TEST_SEED)
-    indices = random.sample(range(len(train_dataset)), min(cfg.NUM_TEST_EXAMPLES, len(train_dataset)))
-
+    indices = random.sample(range(len(dataset)), min(num_examples, len(dataset)))
     examples = []
+
     for idx in indices:
-        item = train_dataset[idx]
-        parnet = item['parnet'].unsqueeze(0).to(DEVICE_UNIT2)
+        item = dataset[idx]
+        parnet = item['parnet_compressed'].unsqueeze(0).to(DEVICE_UNIT2)
         tags = item['tags']
         example_id = item['example_id']
 
-        seed = cfg.NOISE_SEED + int(example_id) if example_id.isdigit() else cfg.NOISE_SEED
+        seed = hash(example_id) % (2**31)
         g = torch.Generator()
         g.manual_seed(seed)
         noise = torch.randn(parnet.shape, generator=g).to(DEVICE_UNIT2) * cfg.NOISE_STD
         noisy_parnet = parnet + noise
 
         tags_tensor = encode_tags(tags, max_len=cfg.TAG_SEQ_MAX_LEN,
-                                  byte_len=cfg.TAG_BYTE_LEN, pad_byte=cfg.PAD_BYTE_VALUE)
+                                  byte_len=cfg.TAG_BYTE_LEN,
+                                  pad_byte=cfg.PAD_BYTE_VALUE)
         tags_tensor = tags_tensor.unsqueeze(0).to(DEVICE_TAG)
-        num_tags = torch.tensor([min(len(tags), cfg.TAG_SEQ_MAX_LEN) if tags else 1], device=DEVICE_TAG)
+        num_tags = torch.tensor([min(len(tags), cfg.TAG_SEQ_MAX_LEN) if tags else 1],
+                                device=DEVICE_TAG)
 
         with torch.no_grad():
             tag_parnets = compute_tag_parnets(tags_tensor, num_tags, tag_model, DEVICE_UNIT2)
-            preds = []; enricheds = []
-            pred = None
-            for step in range(1, max_steps+1):
-                input_parnet = noisy_parnet if step == 1 else pred
-                t_tensor = torch.full((1,), step, device=DEVICE_UNIT2, dtype=torch.float32)
-                pred, enriched = forward_step_with_tag_parnets(tag_parnets, input_parnet, noise, t_tensor, unit1, unit2)
-                preds.append(pred.squeeze(0).cpu())
-                enricheds.append(enriched.squeeze(0).cpu())
-            loss = difference_loss(pred, parnet).item()
-            psnr_val = compute_psnr(pred, parnet)
+            pred, enriched = forward_once(tag_parnets, noisy_parnet, noise, unit1, unit2)
+
+        loss = difference_loss(pred, parnet).item()
+        psnr_val = compute_psnr(pred, parnet)
 
         examples.append({
             'id': example_id,
             'orig': parnet.squeeze(0).cpu(),
             'noisy': noisy_parnet.squeeze(0).cpu(),
-            'preds': preds,
-            'enricheds': enricheds,
+            'pred': pred.squeeze(0).cpu(),
+            'enriched': enriched.squeeze(0).cpu(),
             'loss': loss,
             'psnr': psnr_val
         })
 
-    if decoder is not None and examples:
-        temp_paths = []
-        for name, model, opt in [("tag", tag_model, opt_tag),
-                                 ("unit1", unit1, opt_unit1),
-                                 ("unit2", unit2, opt_unit2)]:
-            path = os.path.join(models_dir, f"temp_test_{name}_restore.pt")
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': opt.state_dict(),
-            }, path)
-            temp_paths.append(path)
+    return examples
 
-        del tag_model, unit1, unit2, opt_tag, opt_unit1, opt_unit2
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-        for ex in examples:
-            base_dir = os.path.join(cfg.TESTS_DIR, f"epoch_{epoch}", f"example_{ex['id']}")
-            # Базовый вызов: оригинал, шум, метрики
-            save_example_images(base_dir, ex['id'],
-                                original_parnet=ex['orig'],
-                                noisy_parnet=ex['noisy'],
-                                loss_val=ex['loss'], psnr_val=ex['psnr'],
-                                decoder=decoder, step=None, save_original=True)
-            # Для каждого шага
-            for step in range(1, max_steps+1):
-                save_example_images(base_dir, ex['id'],
-                                    original_parnet=ex['orig'],
-                                    predicted_parnet=ex['preds'][step-1],
-                                    enriched_parnet=ex['enricheds'][step-1],
-                                    decoder=decoder, step=step, max_steps=max_steps,
-                                    save_original=False)
-
-        del decoder
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-        tag_model = ParNetTag(hidden_dim=cfg.TAG_MODEL_HIDDEN_DIM,
-                              num_layers=cfg.TAG_MODEL_NUM_LAYERS,
-                              activation=cfg.TAG_MODEL_ACTIVATION).to(DEVICE_TAG)
-        unit1 = UnitParnet1(hidden_dim=cfg.UNIT1_HIDDEN_DIM).to(DEVICE_UNIT1)
-        unit2 = UnitParnet2(hidden_dim=cfg.UNIT2_HIDDEN_DIM).to(DEVICE_UNIT2)
-        opt_tag = optim.Adam(tag_model.parameters(), lr=cfg.LEARNING_RATE)
-        opt_unit1 = optim.Adam(unit1.parameters(), lr=cfg.LEARNING_RATE)
-        opt_unit2 = optim.Adam(unit2.parameters(), lr=cfg.LEARNING_RATE)
-
-        for (name, model, opt), path in zip([("tag", tag_model, opt_tag),
-                                             ("unit1", unit1, opt_unit1),
-                                             ("unit2", unit2, opt_unit2)], temp_paths):
-            ckpt = torch.load(path, map_location='cpu', weights_only=False)
-            model.load_state_dict(ckpt['model_state_dict'])
-            opt.load_state_dict(ckpt['optimizer_state_dict'])
-            os.remove(path)
-
+# ---------------------- Тестирование ----------------------
+def run_tests_tag_unit(tag_model, unit1, unit2, train_dataset, epoch, models_dir,
+                       opt_tag, opt_unit1, opt_unit2, decoder, decompressor):
+    num_examples = cfg.NUM_TEST_EXAMPLES
+    examples = collect_test_examples(tag_model, unit1, unit2, train_dataset, num_examples)
+    if not examples or decompressor is None or decoder is None:
+        if decompressor is None:
+            print("Тестовая визуализация пропущена: декомпрессор не загружен.")
         tag_model.train(); unit1.train(); unit2.train()
-        print(f"Test examples for epoch {epoch} saved.")
-    else:
-        tag_model.train(); unit1.train(); unit2.train()
+        return tag_model, unit1, unit2, opt_tag, opt_unit1, opt_unit2
 
+    print("Тестовые данные собраны и находятся в RAM. Выгружаю обучающие модели...")
+
+    temp_paths = []
+    for name, model, opt in [("tag", tag_model, opt_tag),
+                              ("unit1", unit1, opt_unit1),
+                              ("unit2", unit2, opt_unit2)]:
+        path = os.path.join(models_dir, f"temp_test_{name}_restore.pt")
+        torch.save({
+            'epoch': epoch,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': opt.state_dict(),
+        }, path)
+        temp_paths.append(path)
+
+    del tag_model, unit1, unit2, opt_tag, opt_unit1, opt_unit2
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    for ex in examples:
+        base_dir = os.path.join(cfg.TESTS_DIR, f"epoch_{epoch}", f"example_{ex['id']}")
+        save_example_images(base_dir, ex, decompressor, decoder)
+
+    # Восстановление
+    tag_model = ParNetTag().to(DEVICE_TAG)
+    unit1 = UnitParnet1().to(DEVICE_UNIT1)
+    unit2 = UnitParnet2().to(DEVICE_UNIT2)
+    opt_tag = optim.Adam(tag_model.parameters(), lr=cfg.LEARNING_RATE)
+    opt_unit1 = optim.Adam(unit1.parameters(), lr=cfg.LEARNING_RATE)
+    opt_unit2 = optim.Adam(unit2.parameters(), lr=cfg.LEARNING_RATE)
+
+    for (name, model, opt), path in zip([("tag", tag_model, opt_tag),
+                                          ("unit1", unit1, opt_unit1),
+                                          ("unit2", unit2, opt_unit2)], temp_paths):
+        ckpt = torch.load(path, map_location='cpu', weights_only=False)
+        model.load_state_dict(ckpt['model_state_dict'])
+        opt.load_state_dict(ckpt['optimizer_state_dict'])
+        os.remove(path)
+
+    tag_model.train(); unit1.train(); unit2.train()
+    print(f"Test examples for epoch {epoch} saved.")
     return tag_model, unit1, unit2, opt_tag, opt_unit1, opt_unit2
 
 # ---------------------- Основная функция ----------------------
@@ -650,6 +582,9 @@ def train():
     decoder = load_inference_decoder(cfg.DECODER_INFERENCE_PATH)
     if decoder is None:
         print("Warning: Decoder not found – visualization skipped.")
+    decompressor = load_inference_decompressor(cfg.DECOMPRESSOR_INFERENCE_PATH)
+    if decompressor is None:
+        print("Warning: Decompressor not found – visualization will not be possible.")
 
     dataset = ParnetTagDataset(cfg.DATASET_DIR_TAG)
     n_total = len(dataset)
@@ -657,20 +592,20 @@ def train():
     n_train = n_total - n_val
     if n_train <= 0:
         raise RuntimeError("Not enough data for training.")
+
     train_dataset, val_dataset = torch.utils.data.random_split(
         dataset, [n_train, n_val],
         generator=torch.Generator().manual_seed(cfg.RANDOM_SEED)
     )
+
     train_loader = DataLoader(train_dataset, batch_size=cfg.BATCH_SIZE, shuffle=True,
                               collate_fn=collate_tag_fn, num_workers=0, pin_memory=True)
     val_loader = DataLoader(val_dataset, batch_size=cfg.BATCH_SIZE, shuffle=False,
                             collate_fn=collate_tag_fn, num_workers=0, pin_memory=True) if n_val > 0 else None
 
-    tag_model = ParNetTag(hidden_dim=cfg.TAG_MODEL_HIDDEN_DIM,
-                          num_layers=cfg.TAG_MODEL_NUM_LAYERS,
-                          activation=cfg.TAG_MODEL_ACTIVATION).to(DEVICE_TAG)
-    unit1 = UnitParnet1(hidden_dim=cfg.UNIT1_HIDDEN_DIM).to(DEVICE_UNIT1)
-    unit2 = UnitParnet2(hidden_dim=cfg.UNIT2_HIDDEN_DIM).to(DEVICE_UNIT2)
+    tag_model = ParNetTag().to(DEVICE_TAG)
+    unit1 = UnitParnet1().to(DEVICE_UNIT1)
+    unit2 = UnitParnet2().to(DEVICE_UNIT2)
 
     opt_tag = optim.Adam(tag_model.parameters(), lr=cfg.LEARNING_RATE)
     opt_unit1 = optim.Adam(unit1.parameters(), lr=cfg.LEARNING_RATE)
@@ -685,17 +620,19 @@ def train():
         print(f"Epoch {epoch:3d} Average Total: {avg_total:.6f}")
 
         if val_loader and epoch % cfg.VAL_EVERY_EPOCHS == 0:
-            val_loss, val_psnr, tag_model, unit1, unit2, opt_tag, opt_unit1, opt_unit2 = run_validation_tag_unit(
-                tag_model, unit1, unit2, val_loader, epoch, models_dir,
-                opt_tag, opt_unit1, opt_unit2, decoder
-            )
+            val_loss, val_psnr, tag_model, unit1, unit2, opt_tag, opt_unit1, opt_unit2 = \
+                run_validation_tag_unit(
+                    tag_model, unit1, unit2, val_loader, epoch, models_dir,
+                    opt_tag, opt_unit1, opt_unit2, decoder, decompressor
+                )
 
         if epoch % cfg.TEST_EVERY_EPOCHS == 0:
             print(f"Running tests for epoch {epoch}...")
-            tag_model, unit1, unit2, opt_tag, opt_unit1, opt_unit2 = run_tests_tag_unit(
-                tag_model, unit1, unit2, train_dataset, epoch, models_dir,
-                opt_tag, opt_unit1, opt_unit2, decoder
-            )
+            tag_model, unit1, unit2, opt_tag, opt_unit1, opt_unit2 = \
+                run_tests_tag_unit(
+                    tag_model, unit1, unit2, train_dataset, epoch, models_dir,
+                    opt_tag, opt_unit1, opt_unit2, decoder, decompressor
+                )
 
         if epoch % cfg.SAVE_EVERY_EPOCHS == 0:
             save_checkpoints(epoch, tag_model, opt_tag, unit1, opt_unit1, unit2, opt_unit2, models_dir)
