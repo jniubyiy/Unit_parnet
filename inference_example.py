@@ -1,10 +1,123 @@
 # inference_example.py
 """
-Демонстрация использования экспортированных моделей (TorchScript).
-Файлы моделей: *_inference.pt — самодостаточные, не требуют импорта архитектуры.
+Демонстрация использования экспортированных TorchScript-моделей:
+  - Encoder
+  - Decoder
+  - Compressor (уровень 1)
+  - Decompressor (уровень 1)
 
-Каждая модель загружается функцией load_inference_model() и может использоваться
-как обычный nn.Module. Ниже приведено описание входов/выходов для всех моделей и примеры.
+Все модели обновлены: промежуточное представление (парнет) не ограничено по диапазону
+и гарантированно не содержит нулевых значений.
+
+═══════════════════════════════════════════════════════════════════════════════
+ЧТО ТАКОЕ ПАРНЕТ (Parnet)
+═══════════════════════════════════════════════════════════════════════════════
+
+Парнет (сокращение от «parameter network» или «промежуточная сеть») — это
+многоканальное изображение-представление, которое создаётся энкодером из
+обычного RGB-изображения.  В отличие от латентных векторов в классических
+автоэнкодерах, парнет сохраняет пространственную структуру (ширину и высоту),
+но каждый пиксель описывается не 3 цветовыми каналами, а тремя абстрактными
+каналами, не имеющими прямой цветовой интерпретации.
+
+Основные свойства парнета:
+  • Форма: [B, 3, H, W] — 3 канала, пространственное разрешение совпадает с
+    входным изображением (обычно 512×512).
+  • Диапазон значений не ограничен.  Парнет может содержать положительные,
+    отрицательные и большие по модулю числа.
+  • Ни одно значение не равно ровно 0 (гарантируется добавлением микроскопической
+    константы ε = 1e-8 при создании).  Это важно для последующих стадий сжатия
+    и обучения без вырожденных нулевых градиентов.
+  • Парнет — это детерминированное представление: одно и то же изображение
+    всегда даёт одинаковый парнет.
+  • Декодер способен восстановить из парнета RGB-изображение, визуально
+    близкое к исходному (в диапазоне [-1, 1]).
+  • Сжатый парнет (после компрессора) имеет форму [B, C, H/2, W/2], где
+    C — сконфигурированное число каналов (обычно 4 или 12), и наследует
+    свойства отсутствия нулей и неограниченного диапазона.
+
+Парнет можно рассматривать как «цифровой негатив», в котором информация
+об изображении закодирована в многомерном пространственном паттерне.
+
+═══════════════════════════════════════════════════════════════════════════════
+ОПИСАНИЕ МОДЕЛЕЙ
+═══════════════════════════════════════════════════════════════════════════════
+
+1. Encoder (Энкодер)
+   • Назначение: преобразует RGB-изображение в парнет.
+   • Вход:  тензор [B, 3, H, W] в диапазоне [-1, 1] (значения пикселей,
+            нормализованные от -1 до 1).
+   • Выход: тензор [B, 3, H, W] — парнет.  Диапазон не ограничен,
+            отсутствуют точные нули.
+   • Архитектура: несколько остаточных блоков (ResidualBlock) без
+     понижения разрешения, с финальным свёрточным слоем без активации
+     (ранее был Tanh, удалён).  Добавляется ε = 1e-8 для защиты от нулей.
+
+2. Decoder (Декодер)
+   • Назначение: восстанавливает RGB-изображение из парнета.
+   • Вход:  тензор [B, 3, H, W] — парнет с любыми значениями.
+   • Выход: тензор [B, 3, H, W] в диапазоне [-1, 1] (благодаря Tanh на выходе).
+   • Архитектура: зеркальная энкодеру, но с Tanh в конце.
+   • Важно: декодер не требует, чтобы парнет был в каком-то определённом
+     диапазоне; он может обрабатывать даже случайный шум.
+
+3. Compressor (Компрессор, уровень 1)
+   • Назначение: уменьшает пространственное разрешение парнета в 2 раза,
+     увеличивая число каналов (сжатие с сохранением информации).
+   • Вход:  тензор [B, 3, H, W] — парнет.
+   • Выход: тензор [B, C, H/2, W/2] — сжатый парнет (C задаётся в конфиге,
+            обычно 4 или 12).  Диапазон не ограничен, нули отсутствуют.
+   • Архитектура: поднимает число каналов до внутренней размерности,
+     затем spatial downscale (stride=2) и финальная проекция в C каналов.
+
+4. Decompressor (Декомпрессор, уровень 1)
+   • Назначение: восстанавливает полное пространственное разрешение парнета
+     из сжатого представления.
+   • Вход:  тензор [B, C, H/2, W/2] — сжатый парнет.
+   • Выход: тензор [B, 3, H, W] — восстановленный парнет.  Свойства те же:
+     диапазон не ограничен, нулей нет.
+   • Архитектура: сначала обработка на низком разрешении, затем
+     повышение частоты дискретизации (Upsample + свёртка), уменьшение
+     числа каналов до 3.
+
+Все четыре модели экспортированы в TorchScript (файлы *_inference.pt)
+и являются самодостаточными – не требуют импорта исходной архитектуры.
+
+═══════════════════════════════════════════════════════════════════════════════
+ИСПОЛЬЗОВАНИЕ МОДЕЛЕЙ
+═══════════════════════════════════════════════════════════════════════════════
+
+Типичные сценарии:
+
+A. Изображение → парнет → изображение (проверка автоэнкодера)
+   encoder(image) -> parnet
+   decoder(parnet) -> reconstructed_image
+
+B. Сжатие парнета и восстановление (уровень 1)
+   compressor(parnet) -> compressed_parnet
+   decompressor(compressed_parnet) -> parnet_restored
+
+C. Полный пайплайн: изображение → сжатый парнет → изображение
+   encoder(image) -> parnet
+   compressor(parnet) -> compressed
+   decompressor(compressed) -> parnet_restored
+   decoder(parnet_restored) -> final_image
+
+D. Работа с готовыми парнетами (например, из prepared_dataset_parnet)
+   parnet = torch.load("something.pt")['parnet']
+   image = decoder(parnet)
+
+E. Генерация изображений из случайных парнетов
+   random_parnet = torch.randn(1, 3, 512, 512, device='cuda') * 5
+   image = decoder(random_parnet)
+
+Все модели ожидают 4-мерный батч (B, C, H, W).  Одиночный образец
+следует подавать с размерностью батча 1.
+
+Файлы моделей лежат в ./models/ и ./models_compressor/ и называются
+<имя>_inference.pt (например, encoder_inference.pt).
+
+═══════════════════════════════════════════════════════════════════════════════
 """
 
 import torch
@@ -17,75 +130,41 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 def load_inference_model(path: str) -> torch.jit.ScriptModule:
     """
-    Загружает модель из TorchScript файла.
-    Возвращает модуль, готовый к инференсу (eval mode).
+    Загружает TorchScript-модель из файла и переводит в режим eval.
+
+    Параметры
+    ---------
+    path : str
+        Путь к .pt-файлу, экспортированному через torch.jit.save.
+
+    Возвращает
+    -------
+    model : torch.jit.ScriptModule
+        Готовая к инференсу модель на выбранном устройстве.
     """
     model = torch.jit.load(path, map_location=DEVICE)
     model.eval()
     return model
 
 
-# ──────────────────────────────────────────────────────────────────────
-# Описание данных для каждой модели
-# ──────────────────────────────────────────────────────────────────────
+# ------------------------- Утилиты для работы с изображениями ------------------
 
-# ------------------------------------------------------------
-# Encoder (энкодер основного автоэнкодера)
-# ------------------------------------------------------------
-#   Вход:  [B, 3, H, W] — изображение RGB, нормализованное в [-1, 1]
-#   Выход: [B, 3, H, W] — парнет первого уровня (не сжатый),
-#          тоже в диапазоне [-1, 1]
-#
-#   Пример использования: получение парнета из изображения
-#   (затем парнет можно сжимать, передавать и т.д.)
-
-# ------------------------------------------------------------
-# Decoder (декодер основного автоэнкодера)
-# ------------------------------------------------------------
-#   Вход:  [B, 3, H, W] — парнет в [-1, 1]
-#   Выход: [B, 3, H, W] — восстановленное изображение RGB в [-1, 1]
-#
-#   Пример использования: превращение парнета обратно в изображение
-
-# ------------------------------------------------------------
-# Compressor (первый уровень сжатия парнета)
-# ------------------------------------------------------------
-#   Вход:  [B, 3, H, W] — парнет (3 канала, полный размер)
-#   Выход: [B, 4, H/2, W/2] — сжатый парнет, 4 канала, половинный размер,
-#          значения в [-1, 1]
-#
-#   Пример использования: уменьшение размера парнета перед хранением/передачей
-
-# ------------------------------------------------------------
-# Decompressor (первый уровень разжатия)
-# ------------------------------------------------------------
-#   Вход:  [B, 4, H/2, W/2] — сжатый парнет (4 канала)
-#   Выход: [B, 3, H, W] — восстановленный парнет (3 канала, полный размер)
-#
-#   Пример использования: восстановление парнета после сжатия
-
-# ------------------------------------------------------------
-# Compressor Level 2 (второй уровень сжатия)
-# ------------------------------------------------------------
-#   Вход:  [B, 4, H/2, W/2] — уже сжатый парнет первого уровня
-#   Выход: [B, 5, H/4, W/4] — ещё более сжатый парнет, 5 каналов, четверть размера
-#
-#   Пример использования: дальнейшее сжатие, если нужен более компактный код
-
-# ------------------------------------------------------------
-# Decompressor Level 2 (второй уровень разжатия)
-# ------------------------------------------------------------
-#   Вход:  [B, 5, H/4, W/4] — сжатый парнет второго уровня
-#   Выход: [B, 4, H/2, W/2] — восстановленный парнет первого уровня (4 канала)
-#
-#   Пример использования: частичное разжатие для последующего полного восстановления
-
-
-# ──────────────────────────────────────────────────────────────────────
-# Вспомогательные функции для преобразования изображений/тензоров
-# ──────────────────────────────────────────────────────────────────────
 def image_to_tensor(pil_image: Image.Image, size: int = 512) -> torch.Tensor:
-    """Преобразует PIL RGB изображение в тензор [1,3,size,size] в диапазоне [-1,1]."""
+    """
+    Преобразует PIL RGB-изображение в тензор [1, 3, size, size] в диапазоне [-1, 1].
+
+    Параметры
+    ---------
+    pil_image : PIL.Image.Image
+        Входное изображение в формате RGB.
+    size : int
+        Целевой размер (ширина = высота).  По умолчанию 512.
+
+    Возвращает
+    -------
+    tensor : torch.Tensor
+        Тензор на устройстве DEVICE, форма [1, 3, size, size], значения от -1 до 1.
+    """
     img = pil_image.resize((size, size), Image.Resampling.LANCZOS)
     arr = np.array(img).astype(np.float32) / 255.0
     t = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0) * 2 - 1
@@ -93,149 +172,229 @@ def image_to_tensor(pil_image: Image.Image, size: int = 512) -> torch.Tensor:
 
 
 def tensor_to_image(t: torch.Tensor) -> Image.Image:
-    """Преобразует тензор [1,3,H,W] в диапазоне [-1,1] в PIL Image."""
+    """
+    Преобразует тензор [1, 3, H, W] в диапазоне [-1, 1] обратно в PIL Image.
+
+    Параметры
+    ---------
+    t : torch.Tensor
+        Тензор с изображением.
+
+    Возвращает
+    -------
+    img : PIL.Image.Image
+        RGB-изображение.
+    """
     arr = t.squeeze(0).clamp(-1, 1).cpu()
     arr = ((arr + 1) / 2).permute(1, 2, 0).numpy() * 255
     return Image.fromarray(arr.astype(np.uint8))
 
 
-# ──────────────────────────────────────────────────────────────────────
-# 1. Примеры использования каждой модели по отдельности
-# ──────────────────────────────────────────────────────────────────────
-def demo_individual_models():
-    print("=== Демонстрация отдельных моделей ===")
+def print_tensor_info(name: str, tensor: torch.Tensor):
+    """Выводит форму, min, max и число нулей тензора."""
+    shape = tuple(tensor.shape)
+    min_val = tensor.min().item()
+    max_val = tensor.max().item()
+    zero_count = (tensor == 0).sum().item()
+    print(f"{name}: shape {shape}, min {min_val:.4f}, max {max_val:.4f}, zeros: {zero_count}")
 
-    # Загружаем модели (укажите актуальные пути)
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Пример 1 — отдельное использование каждой модели
+# ═════════════════════════════════════════════════════════════════════════════
+
+def demo_individual_models():
+    print("=" * 70)
+    print("1. ИНДИВИДУАЛЬНАЯ РАБОТА МОДЕЛЕЙ")
+    print("=" * 70)
+
     encoder = load_inference_model("./models/encoder_inference.pt")
     decoder = load_inference_model("./models/decoder_inference.pt")
-    compressor1 = load_inference_model("./models_compressor/compressor_inference.pt")
-    decompressor1 = load_inference_model("./models_compressor/decompressor_inference.pt")
-    # Второй уровень (раскомментируйте при наличии)
-    # compressor2 = load_inference_model("./models_compressor_level2/compressor_level2_inference.pt")
-    # decompressor2 = load_inference_model("./models_compressor_level2/decompressor_level2_inference.pt")
+    compressor = load_inference_model("./models_compressor/compressor_inference.pt")
+    decompressor = load_inference_model("./models_compressor/decompressor_inference.pt")
 
-    # Подготовим тестовое изображение (чёрный квадрат или загрузите свой файл)
+    # Создаём тестовое изображение (серый квадрат)
     test_img = Image.new("RGB", (512, 512), color=(128, 128, 128))
-    x = image_to_tensor(test_img)   # [1,3,512,512] в [-1,1]
+    x = image_to_tensor(test_img)   # [1, 3, 512, 512] в [-1, 1]
 
     with torch.no_grad():
-        # --- Только энкодер ---
-        parnet = encoder(x)                 # [1,3,512,512]
-        print(f"Encoder input:  {tuple(x.shape)}")
-        print(f"Encoder output: {tuple(parnet.shape)}")
+        # Энкодер
+        parnet = encoder(x)
+        print("\nEncoder:")
+        print_tensor_info("  input ", x)
+        print_tensor_info("  output", parnet)
 
-        # --- Только декодер (подаём любой парнет) ---
-        rec_img = decoder(parnet)           # [1,3,512,512]
-        print(f"Decoder input:  {tuple(parnet.shape)}")
-        print(f"Decoder output: {tuple(rec_img.shape)}")
+        # Декодер
+        rec_img = decoder(parnet)
+        print("\nDecoder:")
+        print_tensor_info("  input ", parnet)
+        print_tensor_info("  output", rec_img)
 
-        # --- Компрессор первого уровня ---
-        comp1 = compressor1(parnet)         # [1,4,256,256]
-        print(f"Compressor1 input:  {tuple(parnet.shape)}")
-        print(f"Compressor1 output: {tuple(comp1.shape)}")
+        # Компрессор
+        comp1 = compressor(parnet)
+        print("\nCompressor (Level 1):")
+        print_tensor_info("  input ", parnet)
+        print_tensor_info("  output", comp1)
 
-        # --- Декомпрессор первого уровня ---
-        decomp1 = decompressor1(comp1)      # [1,3,512,512]
-        print(f"Decompressor1 input:  {tuple(comp1.shape)}")
-        print(f"Decompressor1 output: {tuple(decomp1.shape)}")
+        # Декомпрессор
+        decomp1 = decompressor(comp1)
+        print("\nDecompressor (Level 1):")
+        print_tensor_info("  input ", comp1)
+        print_tensor_info("  output", decomp1)
 
-        # --- Второй уровень (если доступен) ---
-        # comp2 = compressor2(comp1)         # [1,5,128,128]
-        # decomp2 = decompressor2(comp2)      # [1,4,256,256]
-        # print(f"Compressor2 input:  {tuple(comp1.shape)}")
-        # print(f"Compressor2 output: {tuple(comp2.shape)}")
-        # print(f"Decompressor2 input:  {tuple(comp2.shape)}")
-        # print(f"Decompressor2 output: {tuple(decomp2.shape)}")
-
-    # Сохраняем результат декодирования для проверки
     tensor_to_image(rec_img).save("demo_individual_decoder_output.jpg")
-    print("Сохранено demo_individual_decoder_output.jpg\n")
+    print("\nРезультат декодера сохранён в demo_individual_decoder_output.jpg\n")
 
 
-# ──────────────────────────────────────────────────────────────────────
-# 2. Полный пайплайн сжатия и восстановления изображения
-# ──────────────────────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════════
+# Пример 2 — полный пайплайн: изображение → сжатие → восстановление
+# ═════════════════════════════════════════════════════════════════════════════
+
 def demo_full_pipeline():
-    print("=== Полный пайплайн изображение → парнет → сжатие → восстановление ===")
+    print("=" * 70)
+    print("2. ПОЛНЫЙ ПАЙПЛАЙН: ИЗОБРАЖЕНИЕ → ПАРНЕТ → СЖАТЫЙ ПАРНЕТ → ИЗОБРАЖЕНИЕ")
+    print("=" * 70)
 
     encoder = load_inference_model("./models/encoder_inference.pt")
     decoder = load_inference_model("./models/decoder_inference.pt")
-    compressor1 = load_inference_model("./models_compressor/compressor_inference.pt")
-    decompressor1 = load_inference_model("./models_compressor/decompressor_inference.pt")
-    # Второй уровень (опционально)
-    # compressor2 = load_inference_model("./models_compressor_level2/compressor_level2_inference.pt")
-    # decompressor2 = load_inference_model("./models_compressor_level2/decompressor_level2_inference.pt")
+    compressor = load_inference_model("./models_compressor/compressor_inference.pt")
+    decompressor = load_inference_model("./models_compressor/decompressor_inference.pt")
 
-    # Загружаем реальное изображение или создаём тестовое
+    # Попытка загрузить реальное изображение; при неудаче – синтетический квадрат
     try:
         img = Image.open("test.jpg").convert("RGB")
+        print("Используется test.jpg")
     except FileNotFoundError:
-        print("test.jpg не найден, используется серый квадрат.")
+        print("test.jpg не найден, используется цветной квадрат.")
         img = Image.new("RGB", (512, 512), color=(100, 150, 200))
 
     x = image_to_tensor(img)
 
     with torch.no_grad():
         # Прямой проход
-        parnet = encoder(x)                       # парнет, 3 канала, полный размер
-        comp1 = compressor1(parnet)               # сжатый парнет, 4 канала, половина
-        # comp2 = compressor2(comp1)              # ещё более сжатый (опционально)
+        parnet = encoder(x)                         # [1, 3, 512, 512]
+        compressed = compressor(parnet)             # [1, C, 256, 256]
+        restored_parnet = decompressor(compressed)  # [1, 3, 512, 512]
+        reconstructed = decoder(restored_parnet)    # [1, 3, 512, 512]
 
-        # Обратный проход
-        # decomp1_partial = decompressor2(comp2)  # восстановление до 4 каналов
-        rest_parnet = decompressor1(comp1)        # восстановление до 3 каналов, полный размер
-        reconstructed = decoder(rest_parnet)      # итоговое изображение
-
-    # Сохраняем
     tensor_to_image(reconstructed).save("pipeline_reconstructed.jpg")
-    print("Результат сохранён в pipeline_reconstructed.jpg")
 
-    # Дополнительно можно сравнить размеры сжатых представлений
-    print("\nРазмеры тензоров:")
-    print(f"  Исходное изображение:  {tuple(x.shape)}")
-    print(f"  Парнет (3 канала):      {tuple(parnet.shape)}")
-    print(f"  Сжатый уровень 1:       {tuple(comp1.shape)}")
-    # print(f"  Сжатый уровень 2:       {tuple(comp2.shape)}")
-    print(f"  Восстановленное изобр.:  {tuple(reconstructed.shape)}")
+    print("\nРазмеры тензоров в пайплайне:")
+    print(f"  Исходное изображение : {tuple(x.shape)}")
+    print(f"  Парнет               : {tuple(parnet.shape)}")
+    print(f"  Сжатый парнет (lvl 1): {tuple(compressed.shape)}")
+    print(f"  Восст. парнет        : {tuple(restored_parnet.shape)}")
+    print(f"  Финальное изображение: {tuple(reconstructed.shape)}")
+    print("\nРезультат сохранён в pipeline_reconstructed.jpg\n")
 
 
-# ──────────────────────────────────────────────────────────────────────
-# 3. Использование моделей в других "пакетах" (просто вызов по отдельности)
-#    Показано, как можно строить произвольные графы обработки.
-# ──────────────────────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════════
+# Пример 3 — модульное использование: генерация из случайного парнета
+# ═════════════════════════════════════════════════════════════════════════════
+
 def demo_modular_usage():
-    print("\n=== Модульное использование моделей ===")
-
-    # Здесь демонстрируется, что каждую модель можно применять
-    # независимо и комбинировать в любом порядке.
-    # Например, можно получить сжатый парнет, а затем сразу его передать
-    # в декомпрессор, минуя энкодер, если парнет уже есть.
+    print("=" * 70)
+    print("3. МОДУЛЬНОЕ ИСПОЛЬЗОВАНИЕ: ДЕКОДИРОВАНИЕ СЛУЧАЙНОГО ПАРНЕТА")
+    print("=" * 70)
 
     encoder = load_inference_model("./models/encoder_inference.pt")
     decoder = load_inference_model("./models/decoder_inference.pt")
-    compressor1 = load_inference_model("./models_compressor/compressor_inference.pt")
-    decompressor1 = load_inference_model("./models_compressor/decompressor_inference.pt")
+    compressor = load_inference_model("./models_compressor/compressor_inference.pt")
+    decompressor = load_inference_model("./models_compressor/decompressor_inference.pt")
 
-    # Пример: имеется готовый парнет (например, загруженный из файла)
-    # и мы хотим его сжать и восстановить без участия изображений.
-    dummy_parnet = torch.randn(1, 3, 512, 512, device=DEVICE).clamp(-1, 1)
+    # Создаём случайный парнет с большим разбросом
+    dummy_parnet = torch.randn(1, 3, 512, 512, device=DEVICE) * 5
+    print("\nСлучайный парнет:")
+    print_tensor_info("  parnet", dummy_parnet)
+
     with torch.no_grad():
-        comp = compressor1(dummy_parnet)
-        restored_parnet = decompressor1(comp)
-    print(f"Парнет -> сжатие -> восстановление парнета: форма {restored_parnet.shape}")
+        # Декодируем случайный парнет в изображение
+        generated_img = decoder(dummy_parnet)
+        print_tensor_info("  decoded image", generated_img)
 
-    # Если есть файл с сохранённым парнетом (например, из prepared_dataset_parnet)
-    # можно загрузить его и передать в декодер для визуализации.
-    # loaded = torch.load("prepared_dataset_parnet/0.pt")  # содержит ключ 'parnet'
-    # parnet_from_disk = loaded['parnet'].unsqueeze(0).to(DEVICE)
-    # img = decoder(parnet_from_disk)
-    # tensor_to_image(img).save("from_saved_parnet.jpg")
+        # Также можно сжать случайный парнет
+        compressed_random = compressor(dummy_parnet)
+        print_tensor_info("  compressed random parnet", compressed_random)
+
+        # И восстановить обратно
+        restored_random = decompressor(compressed_random)
+        print_tensor_info("  restored random parnet", restored_random)
+
+        # Декодируем восстановленный парнет
+        final_random_img = decoder(restored_random)
+        print_tensor_info("  final random image", final_random_img)
+
+    tensor_to_image(generated_img).save("demo_random_parnet_decoded.jpg")
+    print("\nИзображение из случайного парнета сохранено в demo_random_parnet_decoded.jpg")
+
+    # Дополнительно: обработка готового парнета из файла
+    print("\nПример загрузки парнета с диска:")
+    try:
+        sample = torch.load("prepared_dataset_parnet/0.pt", map_location=DEVICE, weights_only=False)
+        parnet_from_disk = sample['parnet'].unsqueeze(0)  # [1, 3, H, W]
+        print_tensor_info("  загруженный parnet", parnet_from_disk)
+        with torch.no_grad():
+            img = decoder(parnet_from_disk)
+        tensor_to_image(img).save("from_saved_parnet.jpg")
+        print("  изображение сохранено в from_saved_parnet.jpg")
+    except FileNotFoundError:
+        print("  prepared_dataset_parnet/0.pt не найден, пропускаем загрузку.")
+    print()
 
 
-# ──────────────────────────────────────────────────────────────────────
-# Главная точка входа
-# ──────────────────────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════════
+# Дополнительные примеры использования
+# ═════════════════════════════════════════════════════════════════════════════
+
+def demo_advanced_usage():
+    print("=" * 70)
+    print("4. РАСШИРЕННЫЕ СЦЕНАРИИ")
+    print("=" * 70)
+
+    encoder = load_inference_model("./models/encoder_inference.pt")
+    decoder = load_inference_model("./models/decoder_inference.pt")
+    compressor = load_inference_model("./models_compressor/compressor_inference.pt")
+    decompressor = load_inference_model("./models_compressor/decompressor_inference.pt")
+
+    # Сценарий А: сравнение исходного изображения и восстановленного после полного цикла
+    try:
+        img = Image.open("test.jpg").convert("RGB")
+    except FileNotFoundError:
+        img = Image.new("RGB", (512, 512), color=(100, 150, 200))
+
+    x = image_to_tensor(img)
+
+    with torch.no_grad():
+        # Прямой проход
+        parnet = encoder(x)
+        compressed = compressor(parnet)
+        restored_parnet = decompressor(compressed)
+        reconstructed = decoder(restored_parnet)
+
+        # Сравнение
+        l1_loss = F.l1_loss(reconstructed, x)
+        print(f"\nСценарий А: L1-ошибка между оригиналом и реконструкцией: {l1_loss.item():.6f}")
+
+        # Сценарий B: множественное сжатие (двойной проход)
+        compressed2 = compressor(restored_parnet)
+        restored_parnet2 = decompressor(compressed2)
+        reconstructed2 = decoder(restored_parnet2)
+        l1_cycle2 = F.l1_loss(reconstructed2, x)
+        print(f"Сценарий B: L1 после двух циклов сжатия: {l1_cycle2.item():.6f}")
+
+        # Сценарий C: инференс на батче (несколько изображений)
+        batch = torch.cat([x, x], dim=0)  # два одинаковых изображения
+        print(f"\nСценарий C: батч из {batch.shape[0]} изображений, форма {tuple(batch.shape)}")
+        batch_parnet = encoder(batch)
+        batch_compressed = compressor(batch_parnet)
+        batch_restored = decompressor(batch_compressed)
+        batch_reconstructed = decoder(batch_restored)
+        print(f"  Форма батча после всех шагов: {tuple(batch_reconstructed.shape)}")
+        print(f"  Средняя L1 ошибка по батчу: {F.l1_loss(batch_reconstructed, batch).item():.6f}")
+
+
 if __name__ == "__main__":
     demo_individual_models()
     demo_full_pipeline()
     demo_modular_usage()
+    demo_advanced_usage()
